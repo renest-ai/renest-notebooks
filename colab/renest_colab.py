@@ -88,6 +88,36 @@ def wait_for_http_ready(port: int, timeout: float = 120.0) -> bool:
     return False
 
 
+def wait_for_public_url(url: str, timeout: float = 20.0) -> tuple[bool, str]:
+    """Poll a public tunnel URL until DNS + edge routing return HTTP 200 end-to-end."""
+    deadline = time.monotonic() + timeout
+    probe_url = f"{url.rstrip('/')}/system_stats"
+    last_err = "timed out waiting for HTTP 200"
+    while time.monotonic() < deadline:
+        try:
+            req = urllib.request.Request(probe_url, headers={"User-Agent": "Renest-Colab-HealthCheck/1.0"})
+            with urllib.request.urlopen(req, timeout=4.0) as resp:
+                if 200 <= resp.status < 400:
+                    return True, ""
+                last_err = f"HTTP {resp.status}"
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                # Non-ComfyUI root/fallback path may still answer 404 on /system_stats while / answers 200
+                try:
+                    req_root = urllib.request.Request(url.rstrip("/") + "/", headers={"User-Agent": "Renest-Colab-HealthCheck/1.0"})
+                    with urllib.request.urlopen(req_root, timeout=4.0) as resp2:
+                        if 200 <= resp2.status < 400:
+                            return True, ""
+                except Exception as e2:
+                    last_err = str(e2)
+            else:
+                last_err = f"HTTP {e.code}"
+        except (urllib.error.URLError, OSError) as e:
+            last_err = str(e)
+        time.sleep(1.0)
+    return False, last_err
+
+
 def _terminate_proc(proc: Optional[subprocess.Popen], timeout: float = 5.0) -> None:
     """Terminate a subprocess and its entire process group, ensuring zero orphans.
 
@@ -297,10 +327,13 @@ def launch_webui(
             tunnel_cmd = [
                 cf_bin,
                 "tunnel",
+                "--protocol",
+                "http2",
+                "--no-autoupdate",
                 "--url",
                 f"http://127.0.0.1:{port}",
             ]
-            print("[Renest Colab] Establishing Cloudflare tunnel...", flush=True)
+            print("[Renest Colab] Establishing Cloudflare tunnel (HTTP/2)...", flush=True)
             tunnel_proc = subprocess.Popen(
                 tunnel_cmd,
                 stdout=subprocess.PIPE,
@@ -401,14 +434,30 @@ def launch_webui(
                 return app_proc.returncode or 1
             return 1
 
-        # 3. Declare ready (with Cloudflare tunnel URL or local Colab fallback marker)
+        # 3. Verify tunnel end-to-end before declaring public URL ready
+        if tunnel_url:
+            print(f"[Renest Colab] Verifying Cloudflare tunnel reachability ({tunnel_url})...", flush=True)
+            tunnel_ok, tunnel_err = wait_for_public_url(tunnel_url, timeout=20.0)
+            if not tunnel_ok:
+                msg = f"Cloudflare tunnel {tunnel_url} failed end-to-end check ({tunnel_err})."
+                _dump_tail("cloudflared", tunnel_tail)
+                if allow_local_fallback:
+                    print(f"[Renest Colab] Warning: {msg} Continuing with Colab Proxy.", file=sys.stderr, flush=True)
+                    _stop_tunnel(tunnel_proc)
+                    tunnel_proc = None
+                    tunnel_url = None
+                else:
+                    print(f"Error: {msg}", file=sys.stderr, flush=True)
+                    return 1
+
+        # 4. Declare ready (with verified Cloudflare tunnel URL or local Colab fallback marker)
         if tunnel_url:
             banner = [
                 "",
                 "═" * 70,
                 "  🎉 ComfyUI WebUI is ready!",
-                f"  👉 Public WebUI URL: {tunnel_url}",
-                "     (Unauthenticated public tunnel via Cloudflare. All models loaded)",
+                f"  👉 Public WebUI URL (verified HTTP 200): {tunnel_url}",
+                "     (If *.trycloudflare.com is blocked on your network, use the Colab Proxy link below.)",
                 "═" * 70,
                 "",
             ]
