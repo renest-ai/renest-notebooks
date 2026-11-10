@@ -442,7 +442,7 @@ def launch_webui(
                 msg = f"Cloudflare tunnel {tunnel_url} failed end-to-end check ({tunnel_err})."
                 _dump_tail("cloudflared", tunnel_tail)
                 if allow_local_fallback:
-                    print(f"[Renest Colab] Warning: {msg} Continuing with Colab Proxy.", file=sys.stderr, flush=True)
+                    print(f"[Renest Colab] Warning: {msg} Continuing locally on port {port}.", file=sys.stderr, flush=True)
                     _stop_tunnel(tunnel_proc)
                     tunnel_proc = None
                     tunnel_url = None
@@ -450,14 +450,14 @@ def launch_webui(
                     print(f"Error: {msg}", file=sys.stderr, flush=True)
                     return 1
 
-        # 4. Declare ready (with verified Cloudflare tunnel URL or local Colab fallback marker)
+        # 4. Declare ready (with checked Cloudflare tunnel URL or local fallback marker)
         if tunnel_url:
             banner = [
                 "",
                 "═" * 70,
                 "  🎉 ComfyUI WebUI is ready!",
-                f"  👉 Public WebUI URL (verified HTTP 200): {tunnel_url}",
-                "     (If *.trycloudflare.com is blocked on your network, use the Colab Proxy link below.)",
+                f"  👉 Public WebUI URL (HTTP 200 checked from the Colab runtime): {tunnel_url}",
+                "     (ComfyUI listens locally on 127.0.0.1:8188; cloudflared forwards it to the URL above.)",
                 "═" * 70,
                 "",
             ]
@@ -467,7 +467,7 @@ def launch_webui(
                 "═" * 70,
                 f"  🎉 ComfyUI WebUI is running locally on port {port}!",
                 f"  [Renest Colab] LOCAL_WEBUI_READY port={port}",
-                "  👉 Cloudflare tunnel was unavailable; use the Colab Proxy link below.",
+                "  👉 Cloudflare tunnel was unavailable; check runtime network logs or re-run Step 2.",
                 "═" * 70,
                 "",
             ]
