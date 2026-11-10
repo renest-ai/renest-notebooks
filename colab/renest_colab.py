@@ -12,6 +12,7 @@ Rules & Architecture:
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import os
 import platform
 import re
@@ -41,7 +42,7 @@ def ensure_cloudflared(dest_dir: str = "/tmp") -> str:
         return system_bin
 
     local_bin = os.path.join(dest_dir, "cloudflared")
-    if os.path.isfile(local_bin) and os.access(local_bin, os.X_OK):
+    if os.path.isfile(local_bin) and os.access(local_bin, os.X_OK) and os.path.getsize(local_bin) > 1_000_000:
         return local_bin
 
     os_type = platform.system()
@@ -50,10 +51,12 @@ def ensure_cloudflared(dest_dir: str = "/tmp") -> str:
     if not download_url:
         download_url = CLOUDFLARED_URLS[("Linux", "x86_64")]
 
-    print(f"[Renest Colab] Preparing Cloudflare tunnel binary ({os_type}/{machine})...", flush=True)
+    print(f"[Renest Colab] Downloading Cloudflare tunnel binary ({os_type}/{machine})...", flush=True)
+    tmp_bin = local_bin + ".tmp"
     try:
-        urllib.request.urlretrieve(download_url, local_bin)
-        os.chmod(local_bin, 0o755)
+        urllib.request.urlretrieve(download_url, tmp_bin)
+        os.chmod(tmp_bin, 0o755)
+        os.replace(tmp_bin, local_bin)
     except Exception as e:
         raise RuntimeError(f"Failed to download cloudflared: {e}. Check network connection.") from e
 
@@ -68,7 +71,7 @@ def extract_tunnel_url(log_line: str) -> Optional[str]:
     return None
 
 
-def wait_for_http_ready(port: int, timeout: float = 60.0) -> bool:
+def wait_for_http_ready(port: int, timeout: float = 120.0) -> bool:
     """Poll local HTTP port until ComfyUI answers HTTP 200, or timeout expires."""
     deadline = time.monotonic() + timeout
     endpoints = [f"http://127.0.0.1:{port}/system_stats", f"http://127.0.0.1:{port}/"]
@@ -186,21 +189,48 @@ def _cleanup_procs(app_proc: Optional[subprocess.Popen], tunnel_proc: Optional[s
         raise RuntimeError(msg)
 
 
+def _dump_tail(label: str, tail: deque[str]) -> None:
+    if not tail:
+        return
+    print(f"--- Last {len(tail)} lines from {label} ---", file=sys.stderr, flush=True)
+    for line in tail:
+        print(f"  [{label}] {line}", file=sys.stderr, flush=True)
+
+
+def _stop_tunnel(tunnel_proc: Optional[subprocess.Popen]) -> None:
+    """Terminate an optional tunnel process without failing the caller."""
+    if tunnel_proc is None:
+        return
+    try:
+        _terminate_proc(tunnel_proc, timeout=2.0)
+    except Exception as exc:
+        print(f"[Renest Colab] Warning during tunnel cleanup: {exc}", file=sys.stderr, flush=True)
+
+
 def launch_webui(
     workspace: str,
     port: int = 8188,
-    listen: str = "0.0.0.0",
+    listen: Optional[str] = None,
     cloudflared_path: Optional[str] = None,
-    timeout_tunnel: float = 30.0,
-    timeout_http: float = 60.0,
+    timeout_tunnel: float = 45.0,
+    timeout_http: float = 120.0,
+    allow_local_fallback: bool = False,
 ) -> int:
-    """Launch `renest start` and cloudflared tunnel, continuously draining pipes and guarding lifecycle."""
+    """Launch `renest start` and optional cloudflared tunnel, draining pipes and guarding lifecycle."""
     if not os.path.isdir(workspace):
-        print(f"Error: Workspace directory does not exist: {workspace}", file=sys.stderr)
-        print("Please run `renest restore` first to restore the environment.", file=sys.stderr)
+        print(f"Error: Workspace directory does not exist: {workspace}", file=sys.stderr, flush=True)
+        print("Please run `renest restore` first to restore the environment.", file=sys.stderr, flush=True)
         return 1
 
-    cf_bin = cloudflared_path or ensure_cloudflared()
+    cf_bin: Optional[str] = cloudflared_path
+    if cf_bin is None:
+        try:
+            cf_bin = ensure_cloudflared()
+        except RuntimeError as exc:
+            if not allow_local_fallback:
+                raise
+            print(f"[Renest Colab] Warning: Cloudflare binary unavailable ({exc}); continuing with local port {port}.", file=sys.stderr, flush=True)
+            cf_bin = None
 
     app_proc: Optional[subprocess.Popen] = None
     tunnel_proc: Optional[subprocess.Popen] = None
@@ -218,11 +248,11 @@ def launch_webui(
             "start",
             "--dir",
             workspace,
-            "--listen",
-            listen,
             "--port",
             str(port),
         ]
+        if listen:
+            start_cmd.extend(["--listen", listen])
 
         app_proc = subprocess.Popen(
             start_cmd,
@@ -233,92 +263,187 @@ def launch_webui(
             start_new_session=True,
         )
 
-        tunnel_cmd = [
-            cf_bin,
-            "tunnel",
-            "--url",
-            f"http://127.0.0.1:{port}",
-        ]
-
-        print("[Renest Colab] Establishing Cloudflare tunnel...", flush=True)
-        tunnel_proc = subprocess.Popen(
-            tunnel_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            start_new_session=True,
-        )
-
+        app_tail: deque[str] = deque(maxlen=40)
+        tunnel_tail: deque[str] = deque(maxlen=30)
         tunnel_url_holder: list[str] = []
         tunnel_found_event = threading.Event()
-
-        # Continuous pipe draining threads to avoid OS 64KB pipe buffer deadlock
-        def drain_tunnel():
-            if not tunnel_proc or not tunnel_proc.stdout:
-                return
-            for line in tunnel_proc.stdout:
-                if not tunnel_found_event.is_set():
-                    url = extract_tunnel_url(line)
-                    if url:
-                        tunnel_url_holder.append(url)
-                        tunnel_found_event.set()
 
         def drain_app():
             if not app_proc or not app_proc.stdout:
                 return
             for line in app_proc.stdout:
-                if any(k in line for k in ("Starting server", "Import times", "To see the GUI", "Traceback", "Error")):
-                    print(f"[ComfyUI] {line.strip()}", flush=True)
+                clean = line.rstrip()
+                if clean:
+                    app_tail.append(clean)
+                if any(
+                    k in line
+                    for k in (
+                        "[start]",
+                        "Starting server",
+                        "Import times",
+                        "To see the GUI",
+                        "Traceback",
+                        "Error",
+                        "FATAL",
+                    )
+                ):
+                    print(f"[ComfyUI] {clean}", flush=True)
 
-        t_tunnel = threading.Thread(target=drain_tunnel, daemon=True)
         t_app = threading.Thread(target=drain_app, daemon=True)
-        t_tunnel.start()
         t_app.start()
 
-        # 1. Wait for tunnel URL
-        if not tunnel_found_event.wait(timeout=timeout_tunnel):
-            if tunnel_proc.poll() is not None:
-                print(f"Error: cloudflared exited prematurely (code {tunnel_proc.returncode}).", file=sys.stderr)
-                return tunnel_proc.returncode or 1
-            if app_proc.poll() is not None:
-                print(f"Error: renest start exited prematurely (code {app_proc.returncode}).", file=sys.stderr)
-                return app_proc.returncode or 1
-            print(f"Error: Timed out waiting for Cloudflare tunnel URL ({timeout_tunnel}s).", file=sys.stderr)
-            return 1
+        t_tunnel: Optional[threading.Thread] = None
+        if cf_bin is not None:
+            tunnel_cmd = [
+                cf_bin,
+                "tunnel",
+                "--url",
+                f"http://127.0.0.1:{port}",
+            ]
+            print("[Renest Colab] Establishing Cloudflare tunnel...", flush=True)
+            tunnel_proc = subprocess.Popen(
+                tunnel_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+            )
 
-        tunnel_url = tunnel_url_holder[0]
+            def drain_tunnel():
+                if not tunnel_proc or not tunnel_proc.stdout:
+                    return
+                for line in tunnel_proc.stdout:
+                    clean = line.rstrip()
+                    if clean:
+                        tunnel_tail.append(clean)
+                    if not tunnel_found_event.is_set():
+                        url = extract_tunnel_url(line)
+                        if url:
+                            tunnel_url_holder.append(url)
+                            tunnel_found_event.set()
 
-        # 2. Health check ComfyUI HTTP endpoint: MUST succeed before announcing ready
+            t_tunnel = threading.Thread(target=drain_tunnel, daemon=True)
+            t_tunnel.start()
+
+            # 1. Wait for tunnel URL, polling early-exit status of both children
+            tunnel_deadline = time.monotonic() + timeout_tunnel
+            while not tunnel_found_event.is_set():
+                if app_proc.poll() is not None:
+                    t_app.join(timeout=1.0)
+                    print(
+                        f"Error: renest start exited prematurely (code {app_proc.returncode}).",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    _dump_tail("ComfyUI", app_tail)
+                    return app_proc.returncode or 1
+                if tunnel_proc.poll() is not None:
+                    t_tunnel.join(timeout=1.0)
+                    msg = f"cloudflared exited prematurely (code {tunnel_proc.returncode})."
+                    if allow_local_fallback:
+                        print(f"[Renest Colab] Warning: {msg} Continuing with local WebUI fallback.", file=sys.stderr, flush=True)
+                        _dump_tail("cloudflared", tunnel_tail)
+                        tunnel_proc = None
+                        break
+                    print(f"Error: {msg}", file=sys.stderr, flush=True)
+                    _dump_tail("cloudflared", tunnel_tail)
+                    return tunnel_proc.returncode or 1
+                if time.monotonic() >= tunnel_deadline:
+                    msg = f"Timed out waiting for Cloudflare tunnel URL ({timeout_tunnel}s)."
+                    if allow_local_fallback:
+                        print(f"[Renest Colab] Warning: {msg} Continuing with local WebUI fallback.", file=sys.stderr, flush=True)
+                        _dump_tail("cloudflared", tunnel_tail)
+                        _stop_tunnel(tunnel_proc)
+                        tunnel_proc = None
+                        break
+                    print(f"Error: {msg}", file=sys.stderr, flush=True)
+                    _dump_tail("cloudflared", tunnel_tail)
+                    _dump_tail("ComfyUI", app_tail)
+                    return 1
+                tunnel_found_event.wait(timeout=0.25)
+
+        tunnel_url: Optional[str] = tunnel_url_holder[0] if tunnel_url_holder else None
+        if tunnel_url:
+            print(f"[Renest Colab] Tunnel endpoint ready: {tunnel_url}", flush=True)
+
+        # 2. Health check ComfyUI HTTP endpoint: fail fast if app_proc exits prematurely
         print(f"[Renest Colab] Waiting for ComfyUI to answer on port {port}...", flush=True)
-        http_ready = wait_for_http_ready(port=port, timeout=timeout_http)
-        if not http_ready:
-            print(f"Error: ComfyUI HTTP health check timed out after {timeout_http}s.", file=sys.stderr)
+        http_deadline = time.monotonic() + timeout_http
+        http_ready = False
+        while True:
             if app_proc.poll() is not None:
-                print(f"Error: ComfyUI process terminated with exit code {app_proc.returncode}", file=sys.stderr)
+                t_app.join(timeout=1.0)
+                print(
+                    f"Error: ComfyUI process terminated with exit code {app_proc.returncode}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                _dump_tail("ComfyUI", app_tail)
+                return app_proc.returncode or 1
+            remaining = http_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            slice_timeout = min(1.0, max(0.05, remaining))
+            if wait_for_http_ready(port=port, timeout=slice_timeout):
+                http_ready = True
+                break
+
+        if not http_ready:
+            print(f"Error: ComfyUI HTTP health check timed out after {timeout_http}s.", file=sys.stderr, flush=True)
+            _dump_tail("ComfyUI", app_tail)
+            if app_proc.poll() is not None:
+                print(
+                    f"Error: ComfyUI process terminated with exit code {app_proc.returncode}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 return app_proc.returncode or 1
             return 1
 
-        # 3. Both tunnel URL and HTTP health check passed: declare ready
-        banner = [
-            "",
-            "═" * 70,
-            "  🎉 ComfyUI WebUI is ready!",
-            f"  👉 Public WebUI URL: {tunnel_url}",
-            "     (Unauthenticated public tunnel via Cloudflare. All models loaded)",
-            "═" * 70,
-            "",
-        ]
+        # 3. Declare ready (with Cloudflare tunnel URL or local Colab fallback marker)
+        if tunnel_url:
+            banner = [
+                "",
+                "═" * 70,
+                "  🎉 ComfyUI WebUI is ready!",
+                f"  👉 Public WebUI URL: {tunnel_url}",
+                "     (Unauthenticated public tunnel via Cloudflare. All models loaded)",
+                "═" * 70,
+                "",
+            ]
+        else:
+            banner = [
+                "",
+                "═" * 70,
+                f"  🎉 ComfyUI WebUI is running locally on port {port}!",
+                f"  [Renest Colab] LOCAL_WEBUI_READY port={port}",
+                "  👉 Cloudflare tunnel was unavailable; use the Colab Proxy link below.",
+                "═" * 70,
+                "",
+            ]
         print("\n".join(banner), flush=True)
 
         # 4. Supervise until interrupt or child process termination
         while True:
             if app_proc.poll() is not None:
-                print(f"\n[Renest Colab] ComfyUI process exited (code {app_proc.returncode}).", file=sys.stderr)
+                t_app.join(timeout=1.0)
+                print(f"\n[Renest Colab] ComfyUI process exited (code {app_proc.returncode}).", file=sys.stderr, flush=True)
+                _dump_tail("ComfyUI", app_tail)
                 return app_proc.returncode
-            if tunnel_proc.poll() is not None:
-                print(f"\n[Renest Colab] cloudflared process exited (code {tunnel_proc.returncode}).", file=sys.stderr)
-                return tunnel_proc.returncode
+            if tunnel_proc is not None and tunnel_proc.poll() is not None:
+                if t_tunnel is not None:
+                    t_tunnel.join(timeout=1.0)
+                msg = f"cloudflared process exited (code {tunnel_proc.returncode})."
+                if allow_local_fallback:
+                    print(f"\n[Renest Colab] Warning: {msg} Keeping ComfyUI alive on local port {port}.", file=sys.stderr, flush=True)
+                    _dump_tail("cloudflared", tunnel_tail)
+                    print(f"[Renest Colab] LOCAL_WEBUI_READY port={port}", flush=True)
+                    tunnel_proc = None
+                else:
+                    print(f"\n[Renest Colab] {msg}", file=sys.stderr, flush=True)
+                    _dump_tail("cloudflared", tunnel_tail)
+                    return tunnel_proc.returncode
             time.sleep(1)
 
     except KeyboardInterrupt:
@@ -351,20 +476,25 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     launch_p.add_argument(
         "--listen",
-        default="0.0.0.0",
-        help="ComfyUI listen host (default: 0.0.0.0)",
+        default=None,
+        help="Optional ComfyUI listen host override (only valid when nest records a listen flag)",
     )
     launch_p.add_argument(
         "--timeout-tunnel",
         type=float,
-        default=30.0,
-        help="Max seconds to wait for tunnel URL (default: 30.0)",
+        default=45.0,
+        help="Max seconds to wait for tunnel URL (default: 45.0)",
     )
     launch_p.add_argument(
         "--timeout-http",
         type=float,
-        default=60.0,
-        help="Max seconds to wait for ComfyUI HTTP readiness (default: 60.0)",
+        default=120.0,
+        help="Max seconds to wait for ComfyUI HTTP readiness (default: 120.0)",
+    )
+    launch_p.add_argument(
+        "--allow-local-fallback",
+        action="store_true",
+        help="Keep ComfyUI running locally if cloudflared quick tunnel fails or times out",
     )
 
     args = parser.parse_args(argv)
@@ -377,9 +507,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                 listen=args.listen,
                 timeout_tunnel=args.timeout_tunnel,
                 timeout_http=args.timeout_http,
+                allow_local_fallback=args.allow_local_fallback,
             )
     except RuntimeError as e:
-        print(f"Error: {e}", file=sys.stderr)
+        print(f"Error: {e}", file=sys.stderr, flush=True)
         return 1
 
     return 0
