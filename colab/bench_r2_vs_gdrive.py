@@ -516,6 +516,96 @@ def benchmark_gdown(gdown_map: dict[str, str], dst_dir: Path, specs: list[FileSp
     )
 
 
+def collect_existing_restore_arm(workspace: Path, nest_label: str) -> Optional[ArmResult]:
+    """Read already-completed `renest restore` stage & metrics logs from workspace/.renest."""
+    renest_dir = workspace / ".renest"
+    if not renest_dir.is_dir():
+        return None
+    metrics_files = sorted((renest_dir / "evidence").glob("*/restore-metrics.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    journal_files = sorted(renest_dir.glob("restore-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not metrics_files and not journal_files:
+        return None
+
+    metrics: dict[str, Any] = {}
+    if metrics_files:
+        try:
+            metrics = json.loads(metrics_files[0].read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    journal: dict[str, Any] = {}
+    if journal_files:
+        try:
+            journal = json.loads(journal_files[0].read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    raw_stages = journal.get("stages") or {}
+    stages = {k: v.get("duration_s") for k, v in raw_stages.items() if isinstance(v, dict) and k in ("S0", "S1", "S2", "S3", "S4", "S5")}
+    xfer_bytes = int(metrics.get("transfer_bytes") or 0)
+    xfer_s = float(metrics.get("transfer_seconds") or stages.get("S1") or 0.0)
+    verify_s = float(metrics.get("verify_seconds") or stages.get("S2") or 0.0)
+    total_s = float(metrics.get("total_seconds") or sum(float(v or 0.0) for v in stages.values()))
+    blobs = journal.get("blobs") or {}
+
+    return ArmResult(
+        arm="r2_existing_restore",
+        status="ok",
+        files=len(blobs),
+        total_bytes=xfer_bytes,
+        download_or_copy_s=round(xfer_s, 3),
+        sha256_s=round(verify_s, 3),
+        total_s=round(total_s, 3),
+        effective_mbps=_mbps(xfer_bytes, xfer_s),
+        sha256_verified=True,
+        cache_dropped=False,
+        note=f"nest={nest_label}; stages={stages}",
+        details={"stages": stages, "metrics": metrics, "nest_id": journal.get("nest_id")},
+    )
+
+
+def stage_specs_to_drive(workspace: Path, drive_dir: Path, specs: list[FileSpec]) -> tuple[list[FileSpec], str]:
+    """Copy benchmark files to mounted Google Drive and write bench_manifest.json, respecting Drive free space."""
+    probe_dir = drive_dir
+    while not probe_dir.exists() and probe_dir != probe_dir.parent:
+        probe_dir = probe_dir.parent
+    free_bytes = shutil.disk_usage(probe_dir).free
+    headroom = 256 * 1024 * 1024
+    total_all = sum(s.size_bytes for s in specs)
+
+    selected = list(specs)
+    note = "staged_all"
+    if total_all + headroom > free_bytes:
+        largest = max(specs, key=lambda s: s.size_bytes)
+        if largest.size_bytes + headroom <= free_bytes:
+            selected = [largest]
+            note = f"staged_largest_only (Drive free {free_bytes / (1024**3):.2f} GiB < {total_all / (1024**3):.2f} GiB)"
+        else:
+            raise RuntimeError(
+                f"Insufficient Google Drive space ({free_bytes / (1024**3):.2f} GiB free) "
+                f"for even the largest model ({largest.size_bytes / (1024**3):.2f} GiB)."
+            )
+
+    drive_dir.mkdir(parents=True, exist_ok=True)
+    for sp in selected:
+        src = workspace / sp.rel_path
+        dst = drive_dir / sp.rel_path
+        if dst.is_file() and dst.stat().st_size == sp.size_bytes:
+            continue
+        print(f"[Stage -> Drive] Copying {sp.rel_path} ({sp.size_bytes / (1024**3):.2f} GiB)...", flush=True)
+        copy_with_fsync(src, dst)
+
+    manifest_path = drive_dir / "bench_manifest.json"
+    manifest_path.write_text(json.dumps([asdict(s) for s in selected], indent=2) + "\n", encoding="utf-8")
+    return selected, note
+
+
+def load_drive_manifest(drive_dir: Path) -> list[FileSpec]:
+    """Load FileSpec list from drive_dir/bench_manifest.json."""
+    mp = drive_dir / "bench_manifest.json"
+    raw = json.loads(mp.read_text(encoding="utf-8"))
+    return [FileSpec(**item) for item in raw]
+
+
 def parse_gdown_arg(raw: str) -> dict[str, str]:
     """Parse 'path1=id1,path2=id2' or path to a JSON map into {file_key: drive_file_id}."""
     if os.path.isfile(raw):
@@ -598,6 +688,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--grant", default="", help="Renest grant code or grant.json path for cold R2 restore")
     parser.add_argument("--r2-dir", default=DEFAULT_R2_DIR, help="Target workspace directory for R2 restore")
     parser.add_argument("--skip-r2-restore", action="store_true", help="Reuse existing --r2-dir instead of running cold `renest restore`")
+    parser.add_argument("--collect-existing", action="store_true", help="Record metrics from an already-restored --r2-dir without running restore again")
+    parser.add_argument("--stage-to-drive", action="store_true", help="Copy benchmark files from --r2-dir to --drive-dir and save bench_manifest.json")
+    parser.add_argument("--auto-download", action="store_true", help="Trigger browser download for saved JSON/CSV in Google Colab")
     parser.add_argument("--files", nargs="*", default=None, help="Optional relative file paths inside workspace to benchmark")
     parser.add_argument("--drive-dir", default="", help="Path inside mounted Google Drive containing the same files (e.g. /content/drive/MyDrive/renest-bench)")
     parser.add_argument("--drive-copy-dir", default=DEFAULT_DRIVE_COPY_DIR, help="Local destination directory for Drive FUSE copy test")
@@ -610,21 +703,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     facts = collect_machine_facts(args.out_dir)
     r2_dir = Path(args.r2_dir)
     arms: list[ArmResult] = []
+    specs: list[FileSpec] = []
 
-    if not args.skip_r2_restore:
+    if args.collect_existing:
+        existing_arm = collect_existing_restore_arm(r2_dir, args.nest_label)
+        if existing_arm is not None:
+            arms.append(existing_arm)
+    elif not args.skip_r2_restore:
         if not args.grant:
-            parser.error("--grant is required unless --skip-r2-restore is set")
+            parser.error("--grant is required unless --skip-r2-restore or --collect-existing is set")
         r2_arm, _ = run_r2_restore_arm(args.grant, r2_dir, args.nest_label)
         arms.append(r2_arm)
 
-    if not r2_dir.is_dir():
-        raise RuntimeError(f"Workspace directory not found for reference files: {r2_dir}")
-
-    specs = discover_model_files(r2_dir, rel_paths=args.files)
-    if not specs:
-        raise RuntimeError(f"No reference model files (>=100 MiB) found in {r2_dir}")
-
-    arms.append(benchmark_r2_local_hash(r2_dir, specs))
+    if r2_dir.is_dir():
+        specs = discover_model_files(r2_dir, rel_paths=args.files)
+        if specs:
+            arms.append(benchmark_r2_local_hash(r2_dir, specs))
 
     if args.drive_dir:
         drive_path = Path(args.drive_dir)
@@ -632,11 +726,23 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not mounted:
             arms.append(ArmResult("gdrive_mount_copy", "mount_failed", 0, 0, mount_s, 0.0, mount_s, 0.0, False, False, mount_note))
         else:
-            arms.append(benchmark_drive_mount_copy(drive_path, Path(args.drive_copy_dir), specs, mount_s=mount_s))
-            if not args.skip_fuse_direct:
-                arms.append(benchmark_drive_fuse_direct_hash(drive_path, specs))
+            if args.stage_to_drive:
+                if not specs:
+                    raise RuntimeError(f"No model files found in {r2_dir} to stage to Google Drive")
+                staged_specs, stage_note = stage_specs_to_drive(r2_dir, drive_path, specs)
+                print(f"[Stage -> Drive] Ready ({stage_note}): {[s.rel_path for s in staged_specs]}", flush=True)
+            else:
+                if not specs and (drive_path / "bench_manifest.json").is_file():
+                    specs = load_drive_manifest(drive_path)
+                if not specs:
+                    raise RuntimeError(f"No reference model files found in {r2_dir} or {drive_path / 'bench_manifest.json'}")
+                arms.append(benchmark_drive_mount_copy(drive_path, Path(args.drive_copy_dir), specs, mount_s=mount_s))
+                if not args.skip_fuse_direct:
+                    arms.append(benchmark_drive_fuse_direct_hash(drive_path, specs))
 
     if args.gdown_ids:
+        if not specs:
+            raise RuntimeError("No reference specs available to verify gdown downloads")
         gmap = parse_gdown_arg(args.gdown_ids)
         arms.append(benchmark_gdown(gmap, Path(args.gdown_dir), specs))
 
@@ -646,6 +752,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     print("\n" + format_markdown_summary(facts, arms))
     print(f"\nSaved JSON report: {json_path}")
     print(f"Saved CSV rows:    {csv_path}")
+    if args.auto_download:
+        try:
+            from google.colab import files as colab_files  # type: ignore[import-not-found]
+
+            colab_files.download(str(json_path))
+            colab_files.download(str(csv_path))
+        except Exception:
+            pass
     return 0
 
 
